@@ -24,7 +24,7 @@
                "use_tls":true,
                "keystore_path":"./landsar-base.jks",
                "keystore_password":"landsarMotionModels",
-               "port":8000,
+               "port":8800,
                "use_auth":true,
                "auth_config_path":"file:./shiro.ini",
                "http_redirects":[
@@ -183,7 +183,7 @@
 		"motion model plugin names": "ExampleMotionModelPluginWithSearchEval",
 		"search storage plugin name": "StoreScenariosAndSearchesPlugin",
 		"geodata mode": "disk",
-		"geo cache directory": "geo_cache",
+		"geo cache directory": "geocache-coconino-m",
         	"elevation layer": "dted:dted",
 		"landcover params": "defaultParams/landcover-defaults.txt",
                 "default lpp params": "defaultParams/default-lpp-params.txt",
