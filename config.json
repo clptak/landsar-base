@@ -180,7 +180,7 @@
 		"name": "MotionModelCoordinatorPlugin",
 		"className": "com.bbn.roger.osppre.plugin.motion_model_arch.LandSARMotionModelManagerPlugin",
 		"deploymentModel": "InProcess",
-		"motion model plugin names": "ExampleMotionModelPluginWithSearchEval",
+		"motion model plugin names": "TerrainWalk",
 		"search storage plugin name": "StoreScenariosAndSearchesPlugin",
 		"geodata mode": "disk",
 		"geo cache directory": "geocache-az-state",
@@ -244,8 +244,8 @@
                "port":1621
             },
 	     {
-		"name": "ExampleMotionModelPluginWithSearchEval",
-		"className": "com.bbn.landsar.motionmodel.example.ExampleMotionModelPluginWithSearchEval"
+		"name": "TerrainWalk",
+		"className": "landsar.terrainwalk.TerrainWalkMotionModelPlugin"
 	     }
 
          ]
