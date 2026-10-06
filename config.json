@@ -183,7 +183,7 @@
 		"motion model plugin names": "ExampleMotionModelPluginWithSearchEval",
 		"search storage plugin name": "StoreScenariosAndSearchesPlugin",
 		"geodata mode": "disk",
-		"geo cache directory": "geocache-coconino-m",
+		"geo cache directory": "geocache-az-state",
         	"elevation layer": "dted:dted",
 		"landcover params": "defaultParams/landcover-defaults.txt",
                 "default lpp params": "defaultParams/default-lpp-params.txt",
