@@ -15,7 +15,17 @@ search whose box reaches past the cache edge; the margin keeps starts near the e
 
 Re-running skips tiles that are already complete (LandcoverLatLon.txt is written last), but only
 if they match the planned grid. A different box or margin shifts the grid, so use a new out_dir.
-Requires GDAL's Python bindings and numpy.
+
+Other options
+  --margin-south-km N   different margin for the southern edge (0 = none, e.g. at a border)
+  --reuse DIR           copy matching, complete tiles from an existing cache (renamed to the new grid
+                        indices) and align the new grid to DIR's tile lattice so they fit exactly
+  --align-to DIR        like --reuse but without copying
+  --no-worldcover       leave landcover as no-data where NLCD has none (the model crashes there)
+
+NLCD stops at the US border. Where it has no data, landcover is filled from ESA WorldCover 2021 (10 m,
+global, CC BY 4.0), mapped to the nearest NLCD class (WC_TO_NLCD below); anything WorldCover also lacks
+gets shrub/scrub (52). Requires GDAL's Python bindings and numpy.
 """
 import argparse
 import math
@@ -44,6 +54,63 @@ NLCD_WCS = ("https://www.mrlc.gov/geoserver/mrlc_download/wcs?service=WCS&versio
             "&subset=Long({w},{e})&subset=Lat({s},{n})")
 DEM_EXPORT = ("https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
               "?bbox={w},{s},{e},{n}&bboxSR=4326&size={px},{py}&imageSR=4326&format=tiff&pixelType=F32&f=image")
+
+
+WORLDCOVER = ("/vsicurl/https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/"
+              "ESA_WorldCover_10m_2021_v200_{lat}_Map.tif")
+# ESA WorldCover class -> nearest NLCD class (must exist in landcoverMetadata.txt)
+WC_TO_NLCD = {10: 42,   # tree cover            -> evergreen forest
+              20: 52,   # shrubland             -> shrub/scrub
+              30: 71,   # grassland             -> grassland/herbaceous
+              40: 82,   # cropland              -> cultivated crops
+              50: 23,   # built-up              -> developed, medium intensity
+              60: 31,   # bare / sparse         -> barren land
+              70: 12,   # snow and ice          -> perennial ice/snow
+              80: 11,   # permanent water       -> open water
+              90: 95,   # herbaceous wetland    -> emergent herbaceous wetlands
+              95: 90,   # mangroves             -> woody wetlands
+              100: 31}  # moss and lichen       -> barren land
+DEFAULT_FILL = 52
+
+
+def worldcover_names(bounds):
+    """Names of the 3x3 degree WorldCover tiles (e.g. N30W114) that cover bounds = (s, n, w, e)."""
+    s, n, w, e = bounds
+    names = []
+    for lat0 in range(int(math.floor(s / 3.0)) * 3, int(math.floor((n - 1e-9) / 3.0)) * 3 + 1, 3):
+        for lon0 in range(int(math.floor(w / 3.0)) * 3, int(math.floor((e - 1e-9) / 3.0)) * 3 + 1, 3):
+            names.append("%s%02d%s%03d" % ("N" if lat0 >= 0 else "S", abs(lat0), "E" if lon0 >= 0 else "W", abs(lon0)))
+    return names
+
+
+def worldcover_fill(lc, bounds, ncols, nrows, retries=3):
+    """Fill no-data cells (-9999) of the int array lc from ESA WorldCover; returns (lc, n_filled, n_default)."""
+    missing = lc == -9999
+    if not missing.any():
+        return lc, 0, 0
+    s, n, w, e = bounds
+    srcs = [WORLDCOVER.format(lat=nm) for nm in worldcover_names(bounds)]
+    last = None
+    wc = None
+    for attempt in range(retries):
+        try:
+            ds = gdal.Warp("", srcs, format="MEM", outputBounds=(w, s, e, n), width=ncols, height=nrows,
+                           dstSRS="EPSG:4326", resampleAlg="near", outputType=gdal.GDT_Byte, dstNodata=0)
+            wc = ds.GetRasterBand(1).ReadAsArray()
+            break
+        except Exception as ex:  # noqa: BLE001
+            last = ex
+            time.sleep(5 * (attempt + 1))
+    if wc is None:
+        raise RuntimeError("WorldCover read failed: %r" % (last,))
+    mapped = np.zeros(lc.shape, dtype=int)
+    for k, v in WC_TO_NLCD.items():
+        mapped[wc == k] = v
+    use = missing & (mapped > 0)
+    lc = np.where(use, mapped, lc)
+    still = lc == -9999
+    lc = np.where(still, DEFAULT_FILL, lc)
+    return lc, int(use.sum()), int(still.sum())
 
 
 def fetch(url, retries=4):
@@ -102,7 +169,7 @@ def load_palette(meta_path):
     return pal
 
 
-def build_tile(out_dir, ix, iy, bounds, palette, make_png):
+def build_tile(out_dir, ix, iy, bounds, palette, make_png, use_worldcover=True):
     s, n, w, e = bounds
     mid = (s + n) / 2.0
     nrows = int(math.floor(TILE_LAT * M_PER_DEG / CELL_M))
@@ -120,6 +187,9 @@ def build_tile(out_dir, ix, iy, bounds, palette, make_png):
     elev = warp_to_grid(dem_raw, "dem%d_%d" % (ix, iy), bounds, ncols, nrows, "average")
     elev = np.where(np.isnan(elev) | (elev <= -9000), -9999, np.rint(elev)).astype(int)
     lc = np.where(np.isnan(lc) | (lc <= 0), -9999, lc).astype(int)
+    filled = defaulted = 0
+    if use_worldcover:
+        lc, filled, defaulted = worldcover_fill(lc, bounds, ncols, nrows)
 
     tile_dir = os.path.join(out_dir, "%d-%d" % (ix, iy))
     os.makedirs(tile_dir, exist_ok=True)
@@ -137,7 +207,7 @@ def build_tile(out_dir, ix, iy, bounds, palette, make_png):
     # Written last: marks the tile complete so a re-run can skip it.
     with open(os.path.join(tile_dir, "LandcoverLatLon.txt"), "w") as f:
         f.write("%s,%s,%s,%s" % (s, n, w, e))
-    return ncols, nrows, int((lc == -9999).sum()), int((elev == -9999).sum())
+    return ncols, nrows, int((lc == -9999).sum()), int((elev == -9999).sum()), filled, defaulted
 
 
 def main():
@@ -149,20 +219,36 @@ def main():
     ap.add_argument("east", type=float)
     ap.add_argument("--margin-km", type=float, default=20.0,
                     help="pad the box by this many km on every side (default 20; 0 for none)")
+    ap.add_argument("--margin-south-km", type=float, default=None,
+                    help="margin for the southern edge only (default: same as --margin-km)")
+    ap.add_argument("--reuse", default=None, help="copy matching complete tiles from this existing cache")
+    ap.add_argument("--align-to", default=None, help="snap the tile grid to this existing cache's lattice")
+    ap.add_argument("--no-worldcover", action="store_true", help="do not fill no-data landcover")
     ap.add_argument("--metadata-from", default="geocache-va",
                     help="existing cache to copy landcovertype.txt / landcoverMetadata.txt from")
     ap.add_argument("--no-png", action="store_true", help="skip the PNG previews")
     ap.add_argument("--dry-run", action="store_true", help="print the tile plan and exit")
     args = ap.parse_args()
 
-    if args.margin_km > 0:
-        dlat = args.margin_km * 1000.0 / M_PER_DEG
+    south_km = args.margin_km if args.margin_south_km is None else args.margin_south_km
+    if args.margin_km > 0 or south_km > 0:
+        dlat_n = args.margin_km * 1000.0 / M_PER_DEG
+        dlat_s = south_km * 1000.0 / M_PER_DEG
         # Use the latitude farthest from the equator so the margin is at least margin_km everywhere.
-        dlon = dlat / math.cos(math.radians(max(abs(args.south), abs(args.north)) + dlat))
-        args.south, args.north = round(args.south - dlat, 6), round(args.north + dlat, 6)
+        dlon = dlat_n / math.cos(math.radians(max(abs(args.south), abs(args.north)) + dlat_n))
+        args.south, args.north = round(args.south - dlat_s, 6), round(args.north + dlat_n, 6)
         args.west, args.east = round(args.west - dlon, 6), round(args.east + dlon, 6)
-        print("Requested box padded by %.1f km -> S,N,W,E = %.6f,%.6f,%.6f,%.6f" %
-              (args.margin_km, args.south, args.north, args.west, args.east))
+        print("Requested box padded (N/E/W %.1f km, S %.1f km) -> S,N,W,E = %.6f,%.6f,%.6f,%.6f" %
+              (args.margin_km, south_km, args.south, args.north, args.west, args.east))
+
+    ref_dir = args.reuse or args.align_to
+    if ref_dir:
+        # Snap the south-west corner down onto the lattice of the reference cache so its tiles line up.
+        ref = [float(v) for v in open(os.path.join(ref_dir, "0-0", "LandcoverLatLon.txt")).read().split(",")]
+        ref_s, ref_w = ref[0], ref[2]
+        args.south = round(ref_s + math.floor((args.south - ref_s) / TILE_LAT + 1e-9) * TILE_LAT, 6)
+        args.west = round(ref_w + math.floor((args.west - ref_w) / TILE_LON + 1e-9) * TILE_LON, 6)
+        print("Grid aligned to %s: south-west corner %.6f,%.6f" % (ref_dir, args.south, args.west))
 
     nx = int(math.ceil((args.east - args.west) / TILE_LON - 1e-9))
     ny = int(math.ceil((args.north - args.south) / TILE_LAT - 1e-9))
@@ -180,6 +266,30 @@ def main():
     for fname in ("landcovertype.txt", "landcoverMetadata.txt"):
         shutil.copyfile(os.path.join(args.metadata_from, fname), os.path.join(args.out_dir, fname))
     palette = load_palette(os.path.join(args.out_dir, "landcoverMetadata.txt"))
+
+    if args.reuse:
+        copied = 0
+        for d in sorted(os.listdir(args.reuse)):
+            bf = os.path.join(args.reuse, d, "LandcoverLatLon.txt")
+            if not os.path.exists(bf):
+                continue
+            have = [float(v) for v in open(bf).read().strip().split(",")]
+            ix = int(round((have[2] - args.west) / TILE_LON))
+            iy = int(round((have[0] - args.south) / TILE_LAT))
+            if not (0 <= ix < nx and 0 <= iy < ny):
+                continue
+            plan = (round(args.south + iy * TILE_LAT, 6), round(args.south + (iy + 1) * TILE_LAT, 6),
+                    round(args.west + ix * TILE_LON, 6), round(args.west + (ix + 1) * TILE_LON, 6))
+            dst = os.path.join(args.out_dir, "%d-%d" % (ix, iy))
+            if all(abs(a - b) <= 1e-6 for a, b in zip(have, plan)) and not os.path.exists(dst):
+                # bounds file is copied last so an interrupted copy is not mistaken for a complete tile
+                os.makedirs(dst)
+                for fn in os.listdir(os.path.join(args.reuse, d)):
+                    if fn != "LandcoverLatLon.txt":
+                        shutil.copyfile(os.path.join(args.reuse, d, fn), os.path.join(dst, fn))
+                shutil.copyfile(bf, os.path.join(dst, "LandcoverLatLon.txt"))
+                copied += 1
+        print("Reused %d complete tiles from %s" % (copied, args.reuse), flush=True)
 
     failed, done, t0 = [], 0, time.time()
     total = nx * ny
@@ -200,11 +310,12 @@ def main():
                 print("[%d/%d] %s exists, skipping" % (done, total, tag), flush=True)
                 continue
             try:
-                ncols, nrows, lc_bad, el_bad = build_tile(args.out_dir, ix, iy, (s, n, w, e), palette,
-                                                           not args.no_png)
+                ncols, nrows, lc_bad, el_bad, filled, defaulted = build_tile(
+                    args.out_dir, ix, iy, (s, n, w, e), palette, not args.no_png, not args.no_worldcover)
                 done += 1
-                print("[%d/%d] %s ok  %dx%d  nodata lc=%d elev=%d  (%.0fs elapsed)" %
-                      (done, total, tag, ncols, nrows, lc_bad, el_bad, time.time() - t0), flush=True)
+                extra = "  filled(WorldCover)=%d default=%d" % (filled, defaulted) if filled or defaulted else ""
+                print("[%d/%d] %s ok  %dx%d  nodata lc=%d elev=%d%s  (%.0fs elapsed)" %
+                      (done, total, tag, ncols, nrows, lc_bad, el_bad, extra, time.time() - t0), flush=True)
             except Exception as ex:  # noqa: BLE001
                 failed.append(tag)
                 print("[%s] FAILED: %s" % (tag, ex), flush=True)
