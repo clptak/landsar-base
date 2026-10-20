@@ -78,8 +78,10 @@ EXPOSE 8800
 CMD ["sh", "-c", "exec java -cp 'roger-core-dependencies/dependencies/*:roger-core-1.4.0-fullRelease.jar' com.bbn.roger.launcher.CommandLineLauncher --configFile config.json"]
 ```
 
-`.dockerignore` should exclude `.git`, `geocache-*`, `AreaData`, `scenariosAndSearches`, `requests`,
-`web/missionPackages`, `landsar` (the development machine's users and database) and `derby.log`.
+The repo's own `Dockerfile` only builds a bare Ubuntu/Java 8 base that expects the project mounted at `/opt/roger`;
+it contains no application. Use `Dockerfile.vps` (`build: {context: ./landsar-base, dockerfile: Dockerfile.vps}`).
+`.dockerignore` excludes `.git`, the caches and the run-time state folders. It must not exclude `landsar/`: that is the
+Derby user database holding the demo `admin` login, and the container cannot log anyone in without it.
 `tools/apply_patches.py` compiles Java, which is why the build stage is a JDK. The natives in `nativelibs/` are
 Linux x86-64: use an x86-64 VPS, or expect to rework that.
 

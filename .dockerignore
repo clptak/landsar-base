@@ -1,0 +1,10 @@
+.git
+geocache-*
+geo_cache
+derby.log
+*.pdf
+AreaData
+scenariosAndSearches
+requests
+afterActionReports
+web/missionPackages

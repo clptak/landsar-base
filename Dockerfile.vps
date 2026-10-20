@@ -1,0 +1,18 @@
+# VPS image: builds the dependencies and patches, then runs LandSAR. Cache and state come from volumes.
+FROM eclipse-temurin:11-jdk AS build
+RUN apt-get update && apt-get install -y --no-install-recommends python3 unzip wget ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/landsar
+COPY . .
+RUN wget -q https://github.com/NASAWorldWind/WorldWindJava/releases/download/v2.1.0/worldwind-v2.1.0.zip \
+ && unzip -q -j worldwind-v2.1.0.zip worldwind.jar -d dependencies/ && rm worldwind-v2.1.0.zip
+RUN ./gradlew --no-daemon copyRuntimeLibs
+RUN ls roger-core-dependencies/dependencies | grep -q . && ls dependencies | grep -q osppre-core
+RUN python3 tools/apply_patches.py && python3 tools/build_terrain_walk.py
+
+FROM eclipse-temurin:11-jre
+WORKDIR /opt/landsar
+COPY --from=build /opt/landsar /opt/landsar
+RUN mkdir -p logs AreaData scenariosAndSearches requests afterActionReports web/missionPackages
+ENV LD_LIBRARY_PATH=/opt/landsar/nativelibs
+EXPOSE 8800
+CMD ["java", "-cp", "roger-core-dependencies/dependencies/*:roger-core-1.4.0-fullRelease.jar", "com.bbn.roger.launcher.CommandLineLauncher", "--configFile", "config.json"]
