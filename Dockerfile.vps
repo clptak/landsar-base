@@ -9,6 +9,7 @@ RUN wget -q https://github.com/NASAWorldWind/WorldWindJava/releases/download/v2.
 RUN ./gradlew --no-daemon copyRuntimeLibs
 RUN ls roger-core-dependencies/dependencies | grep -q . && ls dependencies | grep -q osppre-core
 RUN python3 tools/apply_patches.py && python3 tools/build_terrain_walk.py
+RUN mkdir tools-bin && javac -cp 'dependencies/*' -d tools-bin tools/SetPassword.java
 
 FROM eclipse-temurin:11-jre
 WORKDIR /opt/landsar
@@ -16,4 +17,4 @@ COPY --from=build /opt/landsar /opt/landsar
 RUN mkdir -p logs AreaData scenariosAndSearches requests afterActionReports web/missionPackages
 ENV LD_LIBRARY_PATH=/opt/landsar/nativelibs
 EXPOSE 8800
-CMD ["java", "-cp", "roger-core-dependencies/dependencies/*:roger-core-1.4.0-fullRelease.jar", "com.bbn.roger.launcher.CommandLineLauncher", "--configFile", "config.json"]
+CMD ["java", "-Dlogback.configurationFile=logback.xml", "-cp", "roger-core-dependencies/dependencies/*:roger-core-1.4.0-fullRelease.jar", "com.bbn.roger.launcher.CommandLineLauncher", "--configFile", "config.json"]
