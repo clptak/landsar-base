@@ -256,3 +256,31 @@ Corrections to the sketches above:
 - The `shiro.ini` mount in section 8 is optional until `shiro.ini` is edited for LDAP; the image carries the repo copy.
 - The VPS runs whatever is **committed** on the branch: local, uncommitted TerrainWalk changes are not in the image.
 - Log level: `logback.xml` is only honoured with `-Dlogback.configurationFile=logback.xml` (it is not on the classpath), which `Dockerfile.vps` now sets; without it Logback falls back to DEBUG for everything. [untested]
+
+## 14. Caddy proxy and goal options [verified on the VPS, 2026-10-20]
+
+Working block added to the stack's `Caddyfile` (Caddy already reaches the container by its service name on `tak-network`):
+
+```
+landsar.{$PRIMARY_DOMAIN} {
+	import rsa_cert
+	reverse_proxy https://landsar:8800 {
+		# LandSAR (Jetty) builds redirect addresses from the Host header it receives
+		header_up Host {host}
+		# if it still adds its own port to a redirect, strip it
+		header_down Location "^(https://[^/]+):8800/" "$1/"
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+}
+```
+
+- Without `header_up Host {host}` the login redirect went to `landsar:8800` ("Server Not Found").
+- Reload without downtime: `docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile && docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`.
+- The certificate came from Let's Encrypt automatically (tls-alpn-01) once the DNS `A` record existed.
+- Ports 8082, 9095 and 1621 are not proxied or published.
+- The `;jsessionid=...` in the first redirect is Jetty's default for clients without a cookie; harmless.
+- Websocket searches work through the proxy. The page's websocket closes after 300 s idle (`Idle timeout expired: 300001/300000 ms`): if a result does not appear, reload the page (F5) and reselect the lost person.
+- The log message `Error parsing attribute ... Value:` for blank optional fields is expected; the Mac log has the same lines.
+- The goal-points step and `corridor` only appear after the image is rebuilt from a commit that contains them (the first image was built from the earlier TerrainWalk).
