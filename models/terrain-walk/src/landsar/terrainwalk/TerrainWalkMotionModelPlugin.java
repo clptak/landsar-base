@@ -1,6 +1,8 @@
 package landsar.terrainwalk;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileReader;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -9,6 +11,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.PriorityQueue;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
@@ -88,6 +91,36 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 	public static final String SAMPLES = "samples";
 	public static final String DISTANCE = "distance";
 	public static final String SMOOTHING = "smoothing";
+	public static final String GOAL_PULL = "goal pull";
+	public static final String GOAL_RADIUS = "goal radius";
+	public static final String DOWNHILL_BIAS = "downhill bias";
+	public static final String MAX_SLOPE_PARAM = "max slope";
+	public static final String CORRIDOR = "corridor";
+	public static final String TRAIL_FACTOR = "trail factor";
+	public static final String TRAIL_SLOPE = "trail slope";
+	/** config.json property on this plugin's entry: directory of geocache tiles that carry trails.txt. */
+	public static final String TRAIL_CACHE_DIRECTORY = "trail cache directory";
+
+	/** Effort multiplier on trail and road cells when the field is blank. */
+	static final double DEFAULT_TRAIL_FACTOR = 0.5;
+	/** Steepest cell-to-cell slope crossed on a trail cell when the field is blank (a trail up a cliff). */
+	static final double DEFAULT_TRAIL_SLOPE = 1.5;
+	/** On a trail the grade used for walking speed is capped here: switchbacks are gentler than the cells they cross. */
+	static final double TRAIL_MAX_GRADE = 0.3;
+	/** Trace points kept per drawn path. */
+	static final int PATH_POINTS = 400;
+
+	/** Detour tolerance toward a drawn goal when the field is blank: a sideways step costs (1 + pull) x, a step away (1 + 2 pull) x. */
+	static final double DEFAULT_GOAL_PULL = 1.0;
+	/** Spacing, in metres, of the elevation samples used to measure the ground gradient at a candidate step (the DEM cell). */
+	static final double GRADIENT_SAMPLE_M = 30.0;
+	/** Target cell size of the effort-to-goal field, and the most cells it may have (the cell grows beyond that). */
+	static final double FIELD_CELL_M = 30.0;
+	static final int FIELD_MAX_CELLS = 1_500_000;
+	/** A person within this distance of the goal has arrived. */
+	static final double DEFAULT_GOAL_RADIUS_M = 50.0;
+	/** Most trace points kept per person for the corridor map. */
+	static final int CORRIDOR_POINTS_PER_PERSON = 200;
 
 	static final double DEFAULT_HEADING_SPREAD_DEG = 25.0;
 	static final double DEFAULT_COURSE_CHANGE_DEG = 45.0;
@@ -145,8 +178,33 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 				// conversion cannot cast to Double ("Integer cannot be cast to Double") and the whole request is dropped
 				false, Double.class, Unit.NONE));
 
+		PER_LPI_ATTRS.add(new MotionModelAttributeDescription(GOAL_PULL,
+				"how strongly a person heads for a drawn goal point: a step sideways to the goal costs (1 + pull) times a step toward it, a step away (1 + 2 x pull) times. 0 = ignore the goal; default 1 when a goal is drawn; 3 or more approaches a straight line",
+				false, Double.class, Unit.NONE));
+		PER_LPI_ATTRS.add(new MotionModelAttributeDescription(GOAL_RADIUS,
+				"distance in metres from a goal point at which a person has arrived and stops; default 50",
+				false, Double.class, Unit.NONE));
+		PER_LPI_ATTRS.add(new MotionModelAttributeDescription(DOWNHILL_BIAS,
+				"how much a person avoids climbing: effort-metres added per metre of elevation gained. 0 = no preference (default); 2 to 5 sends people down drainages",
+				false, Double.class, Unit.NONE));
+		PER_LPI_ATTRS.add(new MotionModelAttributeDescription(MAX_SLOPE_PARAM,
+				"steepest ground a person will set foot on, as rise over run of the terrain itself (not of the step taken); default 0.75 (about 37 degrees). Steeper ground is a wall from every direction",
+				false, Double.class, Unit.NONE));
+		PER_LPI_ATTRS.add(new MotionModelAttributeDescription(CORRIDOR,
+				"1 = every hourly map shows the ground covered over the whole walk (a route corridor) instead of positions at that hour; 0 = positions by hour (default). Search updates always use positions by hour",
+				false, Double.class, Unit.NONE));
+
+		PER_LPI_ATTRS.add(new MotionModelAttributeDescription(TRAIL_FACTOR,
+				"effort multiplier on trail and road cells (needs trails.txt in the geocache); default 0.5. Lower = people prefer and stay on trails more",
+				false, Double.class, Unit.NONE));
+		PER_LPI_ATTRS.add(new MotionModelAttributeDescription(TRAIL_SLOPE,
+				"steepest rise-over-run a person will cross on a trail cell; default 1.5, so a switchbacked trail up a cliff is passable while the cliff is not",
+				false, Double.class, Unit.NONE));
+
 		PER_LPI_GEOSPATIAL_ATTRS.add(new GeospatialInputDescriptions(
 				UserEnteredGeospatialData.GeospatialDataType.EXCLUSION_ZONE, false));
+		PER_LPI_GEOSPATIAL_ATTRS.add(new GeospatialInputDescriptions(
+				UserEnteredGeospatialData.GeospatialDataType.GOAL_POINTS, false));
 
 		REQUIRED_AREA_DATA.add(new AreaDataType(AreaDataType.ELEVATION, true));
 		REQUIRED_AREA_DATA.add(new AreaDataType(AreaDataType.LANDCOVER, true));
@@ -159,18 +217,34 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 	private final Map<UUID, Double> smoothingSettings = new ConcurrentHashMap<>();
 	private static final String INTERNAL_MODEL_FILENAME = "internal_model.json";
 	private boolean started;
+	/** Trails grid from "trail cache directory", or null when not configured or the directory is missing. */
+	private TrailGrid trails;
 
 	// ---- plugin plumbing ------------------------------------------------------------------------------
 
 	@Override
 	public void configure(Map<String, Object> configurationOptions, PluginContext context)
 			throws InsufficientConfigurationException {
-		// nothing is configured in config.json
+		Object dir = configurationOptions == null ? null : configurationOptions.get(TRAIL_CACHE_DIRECTORY);
+		if (dir != null && !dir.toString().trim().isEmpty()) {
+			File f = new File(dir.toString().trim());
+			if (f.isDirectory()) {
+				trails = new TrailGrid(f);
+				LOGGER.info("TerrainWalk: trails from {} ({} tiles with trails.txt)", f, trails.tileCount());
+			} else {
+				LOGGER.warn("TerrainWalk: '{}' = {} is not a directory; running without trails", TRAIL_CACHE_DIRECTORY, f);
+			}
+		} else {
+			LOGGER.info("TerrainWalk: no '{}' configured; running without trails", TRAIL_CACHE_DIRECTORY);
+		}
 	}
 
 	@Override
 	public Set<AttributeDescription> getConfigurationAttributes() {
-		return new HashSet<>();
+		Set<AttributeDescription> attrs = new HashSet<>();
+		attrs.add(new AttributeDescription(TRAIL_CACHE_DIRECTORY,
+				"geocache directory whose tiles carry trails.txt (see tools/build_trails.py); optional", false, String.class));
+		return attrs;
 	}
 
 	@Override
@@ -257,6 +331,13 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 		anyErrors |= checkRange(status, params, SAMPLES, 10.0, MAX_SAMPLES);
 		anyErrors |= checkRange(status, params, DISTANCE, 0.01, 1000.0);
 		anyErrors |= checkRange(status, params, SMOOTHING, 0.0, 5000.0);
+		anyErrors |= checkRange(status, params, GOAL_PULL, 0.0, 100.0);
+		anyErrors |= checkRange(status, params, GOAL_RADIUS, 1.0, 5000.0);
+		anyErrors |= checkRange(status, params, DOWNHILL_BIAS, 0.0, 100.0);
+		anyErrors |= checkRange(status, params, MAX_SLOPE_PARAM, 0.05, 10.0);
+		anyErrors |= checkRange(status, params, CORRIDOR, 0.0, 1.0);
+		anyErrors |= checkRange(status, params, TRAIL_FACTOR, 0.01, 10.0);
+		anyErrors |= checkRange(status, params, TRAIL_SLOPE, 0.05, 10.0);
 
 		if (anyErrors) {
 			motionModelManager.sendStatusUpdateMessage(status);
@@ -303,6 +384,16 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 		final int samples = (int) Math.round(orDefault(number(params, SAMPLES), DEFAULT_SAMPLES));
 		final Double distanceKm = number(params, DISTANCE);
 		final double maxDistanceM = distanceKm == null ? Double.MAX_VALUE : distanceKm * 1000.0;
+		final List<LatLonGeo> goals = geospatialInputs != null && geospatialInputs.getGoalPoints() != null
+				&& !geospatialInputs.getGoalPoints().isEmpty() ? new ArrayList<>(geospatialInputs.getGoalPoints()) : null;
+		final double goalPull = orDefault(number(params, GOAL_PULL), goals == null ? 0.0 : DEFAULT_GOAL_PULL);
+		final double goalRadiusM = orDefault(number(params, GOAL_RADIUS), DEFAULT_GOAL_RADIUS_M);
+		final double downhillBias = orDefault(number(params, DOWNHILL_BIAS), 0.0);
+		final double maxSlope = orDefault(number(params, MAX_SLOPE_PARAM), MAX_SLOPE);
+		final boolean corridor = orDefault(number(params, CORRIDOR), 0.0) >= 0.5;
+		final double trailFactor = orDefault(number(params, TRAIL_FACTOR), DEFAULT_TRAIL_FACTOR);
+		final double trailSlope = orDefault(number(params, TRAIL_SLOPE), DEFAULT_TRAIL_SLOPE);
+		final TrailGrid trailGrid = trails;
 		Double smoothing = number(params, SMOOTHING);
 		if (smoothing != null && !Double.isNaN(smoothing)) {
 			smoothingSettings.put(lpiId, smoothing);
@@ -314,15 +405,45 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 				? (Number) params.get(MotionModelConstants.RANDOM_SEED_PARAMETER) : null;
 		final long baseSeed = (seedParam == null || seedParam.longValue() == 0L) ? System.nanoTime() : seedParam.longValue();
 
+		final List<CostField> fields = new ArrayList<>();
+		if (goals != null && goalPull > 0.0) {
+			motionModelManager.sendInProgressUpdate(this.name + ": planning routes to " + goals.size() + " goal(s).", status);
+			for (LatLonGeo g : goals) {
+				CostField f = CostField.build(areaData, g, geospatialInputs, stayOutOfWater, maxSlope, trails, trailFactor, trailSlope);
+				fields.add(f);
+				LOGGER.info("TerrainWalk: effort-to-goal field {}x{} cells of {} m; start reachable: {}", f.nLon, f.nLat,
+						Math.round(f.cellM), starts.isEmpty() ? "?" : Double.isFinite(f.costAt(starts.get(0))));
+			}
+		}
 		motionModelManager.sendInProgressUpdate(this.name + ": simulating " + samples + " people for " + hours + " hours.", status);
 
-		List<Sample> samplePaths = IntStream.range(0, samples).parallel().mapToObj(i -> {
+		List<Walk> walks = IntStream.range(0, samples).parallel().mapToObj(i -> {
 			Random rnd = new Random(baseSeed + i * 0x9E3779B97F4A7C15L);
 			LatLonGeo start = starts.get(i % starts.size());
-			List<LatLonGeo> hourly = walk(rnd, start, startTime, hours, speedKph, heading, headingSpread, courseChange,
-					options, stepM, randomness, maxDistanceM, schedule, areaData, geospatialInputs, stayOutOfWater, null);
-			return new Sample(startTime, HOUR_MS, hourly, new ArrayList<Double>());
+			int gi = goals == null ? -1 : rnd.nextInt(goals.size());
+			LatLonGeo goal = gi < 0 ? null : goals.get(gi);
+			CostField field = gi < 0 || fields.isEmpty() ? null : fields.get(gi);
+			List<LatLonGeo> trace = (corridor || i < PATHS_TO_DISPLAY) ? new ArrayList<>() : null;
+			return walk(rnd, start, startTime, hours, speedKph, heading, headingSpread, courseChange,
+					options, stepM, randomness, maxDistanceM, schedule, areaData, geospatialInputs, stayOutOfWater, trace,
+					goal, field, goalPull, goalRadiusM, downhillBias, maxSlope, trailGrid, trailFactor, trailSlope);
 		}).collect(Collectors.toList());
+
+		if (goals != null) {
+			long arrived = walks.stream().filter(w -> w.arrived).count();
+			if (arrived == 0) {
+				String msg = this.name + ": none of the " + samples + " simulated people reached the goal within " + hours
+						+ " hours; keeping all of them. Try more hours, a higher goal pull, a larger goal radius or a gentler max slope.";
+				LOGGER.warn(msg);
+				motionModelManager.sendInProgressUpdate(msg, status);
+			} else {
+				motionModelManager.sendInProgressUpdate(this.name + ": " + arrived + " of " + samples
+						+ " simulated people reached the goal; the rest are discarded.", status);
+				walks = walks.stream().filter(w -> w.arrived).collect(Collectors.toList());
+			}
+		}
+		List<Sample> samplePaths = walks.stream()
+				.map(w -> new Sample(startTime, HOUR_MS, w.hourly, new ArrayList<Double>())).collect(Collectors.toList());
 
 		ExampleInternalModel model = new ExampleInternalModel();
 		model.setSpeed(speedKph);
@@ -332,8 +453,24 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 		lpiData.put(lpiId, model);
 
 		Map<Long, ProbabilityDistribution> distributions = new HashMap<>();
-		for (long t = startTime; t <= model.endTime(); t += HOUR_MS) {
-			distributions.put(t, distribution(lpiId, t, areaData.getBoundingBox(), model.getLocationsAtTime(t), null));
+		if (corridor) {
+			// one map of all the ground covered, repeated for every hour; search updates fall back to positions by hour
+			List<LatLonGeo> covered = new ArrayList<>();
+			for (Walk w : walks) {
+				covered.addAll(w.thinnedTrace(CORRIDOR_POINTS_PER_PERSON));
+			}
+			double[][] grid = makeGrid(areaData.getBoundingBox(), covered, null, smoothingSettings.get(lpiId));
+			for (long t = startTime; t <= model.endTime(); t += HOUR_MS) {
+				double[][] copy = new double[grid.length][];
+				for (int r = 0; r < grid.length; r++) {
+					copy[r] = grid[r].clone();
+				}
+				distributions.put(t, new ProbabilityDistribution(lpiId, t, copy, areaData.getBoundingBox()));
+			}
+		} else {
+			for (long t = startTime; t <= model.endTime(); t += HOUR_MS) {
+				distributions.put(t, distribution(lpiId, t, areaData.getBoundingBox(), model.getLocationsAtTime(t), null));
+			}
 		}
 
 		motionModelManager.sendInProgressUpdate(this.name + ": finished computing.", status);
@@ -341,8 +478,8 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 		result.setLpiId(lpiId);
 		result.setInitialDistribution(distributions);
 		result.copyInitialDistToDistWithSearches();
-		List<Path> paths = samplePaths.stream().limit(PATHS_TO_DISPLAY)
-				.map(s -> new Path(s.getPoints())).collect(Collectors.toList());
+		List<Path> paths = walks.stream().limit(PATHS_TO_DISPLAY)
+				.map(w -> new Path(new ArrayList<>(w.thinnedTrace(PATH_POINTS)))).collect(Collectors.toList());
 		result.setPaths(paths);
 		result.setGeneratedTimestamp(System.currentTimeMillis());
 		result.setGeneratingModelName(this.getName());
@@ -370,18 +507,302 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 	 *
 	 * Package-private and static so that it can be tested without a running LandSAR.
 	 */
-	static List<LatLonGeo> walk(Random rnd, LatLonGeo start, long startTime, int hours, double speedKph, Double headingDeg,
+	/** Tobler's hiking function as a speed factor (1 on the flat), for a grade in rise over run. */
+	static double tobler(double grade) {
+		return Math.max(0.1, Math.min(1.25, Math.exp(-3.5 * (Math.abs(grade + 0.05) - 0.05))));
+	}
+
+	/**
+	 * Effort still needed to reach a goal from every cell of a grid over the bounding box: Dijkstra from the goal,
+	 * with edges priced exactly as the walkers price their steps (slope, landcover, trails, passability). Walkers
+	 * use it to measure progress, so a trail up a cliff reads as progress even though it points away from the goal.
+	 */
+	static final class CostField {
+		final double south, west, dLat, dLon, cellM;
+		final int nLat, nLon;
+		final float[] cost; // row-major, row 0 = south; +Inf = unreachable
+
+		private CostField(double south, double west, double dLat, double dLon, double cellM, int nLat, int nLon, float[] cost) {
+			this.south = south; this.west = west; this.dLat = dLat; this.dLon = dLon; this.cellM = cellM;
+			this.nLat = nLat; this.nLon = nLon; this.cost = cost;
+		}
+
+		double costAt(LatLonGeo p) {
+			int i = (int) ((p.getLatDeg() - south) / dLat), j = (int) ((p.getLonDeg() - west) / dLon);
+			if (i < 0 || j < 0 || i >= nLat || j >= nLon) {
+				return Double.POSITIVE_INFINITY;
+			}
+			return cost[i * nLon + j];
+		}
+
+		static CostField build(AreaData area, LatLonGeo goal, UserEnteredGeospatialData geo, boolean stayOutOfWater,
+				double maxSlope, TrailGrid trails, double trailFactor, double trailSlope) {
+			BoundingBox box = area.getBoundingBox();
+			AbstractElevationData elevation = area.getElevationData();
+			AbstractLandCoverData landcover = area.getLandcoverData();
+			double south = box.getSouthLatDeg(), north = box.getNorthLatDeg(), west = box.getWestLonDeg(), east = box.getEastLonDeg();
+			double nsM = (north - south) * 111_111.11;
+			double ewM = (east - west) * 111_111.11 * Math.cos(Math.toRadians((north + south) / 2.0));
+			double cellM = FIELD_CELL_M;
+			if ((nsM / cellM) * (ewM / cellM) > FIELD_MAX_CELLS) {
+				cellM = Math.sqrt(nsM * ewM / FIELD_MAX_CELLS);
+			}
+			int nLat = Math.max(2, (int) Math.ceil(nsM / cellM)), nLon = Math.max(2, (int) Math.ceil(ewM / cellM));
+			double dLat = (north - south) / nLat, dLon = (east - west) / nLon;
+			int n = nLat * nLon;
+
+			float[] elev = new float[n], soa = new float[n];
+			byte[] lc = new byte[n];
+			boolean[] passable = new boolean[n], onTrail = new boolean[n];
+			for (int i = 0; i < nLat; i++) {
+				double lat = south + (i + 0.5) * dLat;
+				for (int j = 0; j < nLon; j++) {
+					double lon = west + (j + 0.5) * dLon;
+					int k = i * nLon + j;
+					LatLonGeo p = new LatLonGeo(lat, lon);
+					elev[k] = (float) elevation.getElevationMetersForLatLon(p);
+					double sf = landcover.getSoaFactor(lat, lon);
+					soa[k] = (float) ((Double.isNaN(sf) || sf <= 0.0) ? 1.0 : sf);
+					lc[k] = (byte) Math.max(1, Math.min(127, landcover.getCost(lat, lon)));
+					onTrail[k] = trails != null && trails.at(lat, lon) > 0;
+					double g = gradient(elevation, p);
+					passable[k] = allowed(p, box, geo, landcover, stayOutOfWater) && g <= (onTrail[k] ? trailSlope : maxSlope);
+				}
+			}
+
+			float[] cost = new float[n];
+			java.util.Arrays.fill(cost, Float.POSITIVE_INFINITY);
+			int gi = (int) ((goal.getLatDeg() - south) / dLat), gj = (int) ((goal.getLonDeg() - west) / dLon);
+			gi = Math.max(0, Math.min(nLat - 1, gi));
+			gj = Math.max(0, Math.min(nLon - 1, gj));
+			int start = gi * nLon + gj;
+			passable[start] = true; // the goal itself is always reachable
+			PriorityQueue<long[]> pq = new PriorityQueue<>((a, b) -> Double.compare(Double.longBitsToDouble(a[0]), Double.longBitsToDouble(b[0])));
+			cost[start] = 0f;
+			pq.add(new long[] {Double.doubleToLongBits(0.0), start});
+			double mLat = dLat * 111_111.11, mLon = dLon * 111_111.11 * Math.cos(Math.toRadians((north + south) / 2.0));
+			int[] di = {-1, -1, -1, 0, 0, 1, 1, 1}, dj = {-1, 0, 1, -1, 1, -1, 0, 1};
+			while (!pq.isEmpty()) {
+				long[] top = pq.poll();
+				double c = Double.longBitsToDouble(top[0]);
+				int b = (int) top[1];
+				if (c > cost[b]) {
+					continue;
+				}
+				int bi = b / nLon, bj = b % nLon;
+				for (int d = 0; d < 8; d++) {
+					int ai = bi + di[d], aj = bj + dj[d];
+					if (ai < 0 || aj < 0 || ai >= nLat || aj >= nLon) {
+						continue;
+					}
+					int a = ai * nLon + aj;
+					if (!passable[b] && b != start) {
+						break;
+					}
+					if (!passable[a]) {
+						continue;
+					}
+					// price the step a -> b the way a walker would
+					double dist = Math.sqrt((di[d] * mLat) * (di[d] * mLat) + (dj[d] * mLon) * (dj[d] * mLon));
+					double grade = (elev[b] - elev[a]) / dist;
+					if (onTrail[b]) {
+						grade = Math.max(-TRAIL_MAX_GRADE, Math.min(TRAIL_MAX_GRADE, grade));
+					}
+					double effort = dist / (soa[b] * tobler(grade));
+					if (onTrail[b]) {
+						effort *= trailFactor;
+					}
+					double step = effort * lc[b];
+					double nc = c + step;
+					if ((float) nc < cost[a]) {
+						cost[a] = (float) nc;
+						pq.add(new long[] {Double.doubleToLongBits(cost[a]), a}); // queue the stored float, so the pop check matches
+					}
+				}
+			}
+			return new CostField(south, west, dLat, dLon, cellM, nLat, nLon, cost);
+		}
+	}
+
+	/**
+	 * Trail / road cells from trails.txt files in geocache tiles (written by tools/build_trails.py): 0 = none,
+	 * 1 = trail, 2 = road. Tiles are found by their LandcoverLatLon.txt bounds and loaded on first use.
+	 * Safe to call from parallel streams.
+	 */
+	static final class TrailGrid {
+		private static final class Tile {
+			final double s, n, w, e;
+			final File file;
+			volatile byte[] cells; // row-major, row 0 = north
+			volatile int ncols, nrows;
+			volatile boolean failed;
+
+			Tile(double s, double n, double w, double e, File file) {
+				this.s = s; this.n = n; this.w = w; this.e = e; this.file = file;
+			}
+
+			boolean contains(double lat, double lon) {
+				return lat >= s && lat < n && lon >= w && lon < e;
+			}
+
+			synchronized void load() {
+				if (cells != null || failed) {
+					return;
+				}
+				try (BufferedReader r = new BufferedReader(new FileReader(file), 1 << 16)) {
+					int nc = 0, nr = 0;
+					for (int i = 0; i < 6; i++) {
+						String[] kv = r.readLine().trim().split("\\s+");
+						if (kv[0].equals("ncols")) nc = Integer.parseInt(kv[1]);
+						if (kv[0].equals("nrows")) nr = Integer.parseInt(kv[1]);
+					}
+					byte[] data = new byte[nc * nr];
+					int row = 0;
+					String line;
+					while (row < nr && (line = r.readLine()) != null) {
+						int col = 0, i = 0, len = line.length();
+						while (col < nc && i < len) {
+							while (i < len && line.charAt(i) == ' ') i++;
+							int start = i;
+							while (i < len && line.charAt(i) != ' ') i++;
+							if (i > start) {
+								int v = Integer.parseInt(line.substring(start, i));
+								data[row * nc + col] = (byte) (v < 0 ? 0 : Math.min(v, 127));
+								col++;
+							}
+						}
+						row++;
+					}
+					ncols = nc;
+					nrows = nr;
+					cells = data;
+					LOGGER.info("TerrainWalk: loaded trails {} ({}x{})", file, nc, nr);
+				} catch (Exception ex) {
+					failed = true;
+					LOGGER.warn("TerrainWalk: could not read {}: {}", file, ex.toString());
+				}
+			}
+
+			int at(double lat, double lon) {
+				if (cells == null) {
+					load();
+					if (cells == null) {
+						return 0;
+					}
+				}
+				int col = (int) ((lon - w) / (e - w) * ncols);
+				int row = (int) ((n - lat) / (n - s) * nrows);
+				if (col < 0 || row < 0 || col >= ncols || row >= nrows) {
+					return 0;
+				}
+				return cells[row * ncols + col];
+			}
+		}
+
+		private final List<Tile> tiles = new ArrayList<>();
+
+		TrailGrid(File dir) {
+			File[] subs = dir.listFiles(File::isDirectory);
+			if (subs == null) {
+				return;
+			}
+			for (File sub : subs) {
+				File bounds = new File(sub, "LandcoverLatLon.txt");
+				File trails = new File(sub, "trails.txt");
+				if (!bounds.isFile() || !trails.isFile()) {
+					continue;
+				}
+				try (BufferedReader r = new BufferedReader(new FileReader(bounds))) {
+					String[] p = r.readLine().trim().split(",");
+					tiles.add(new Tile(Double.parseDouble(p[0]), Double.parseDouble(p[1]),
+							Double.parseDouble(p[2]), Double.parseDouble(p[3]), trails));
+				} catch (Exception ex) {
+					LOGGER.warn("TerrainWalk: bad bounds file {}: {}", bounds, ex.toString());
+				}
+			}
+		}
+
+		int tileCount() {
+			return tiles.size();
+		}
+
+		/** 0 = no trail or no data, 1 = trail, 2 = road. */
+		int at(double lat, double lon) {
+			for (Tile t : tiles) {
+				if (t.contains(lat, lon)) {
+					return t.at(lat, lon);
+				}
+			}
+			return 0;
+		}
+	}
+
+	/** One simulated person: hourly positions, whether they reached their goal, and (optionally) every step. */
+	static final class Walk {
+		final List<LatLonGeo> hourly;
+		final boolean arrived;
+		final List<LatLonGeo> trace;
+
+		Walk(List<LatLonGeo> hourly, boolean arrived, List<LatLonGeo> trace) {
+			this.hourly = hourly;
+			this.arrived = arrived;
+			this.trace = trace;
+		}
+
+		/** At most {@code max} evenly spaced points of the trace (or the hourly positions if no trace was kept). */
+		List<LatLonGeo> thinnedTrace(int max) {
+			List<LatLonGeo> src = trace != null ? trace : hourly;
+			if (src.size() <= max) {
+				return src;
+			}
+			List<LatLonGeo> out = new ArrayList<>(max);
+			for (int i = 0; i < max; i++) {
+				out.add(src.get((int) ((long) i * src.size() / max)));
+			}
+			return out;
+		}
+	}
+
+	/** Compass bearing in degrees (0 = north, 90 = east) from {@code from} to {@code to}. */
+	static double bearingDeg(LatLonGeo from, LatLonGeo to) {
+		double lat1 = Math.toRadians(from.getLatDeg()), lat2 = Math.toRadians(to.getLatDeg());
+		double dLon = Math.toRadians(to.getLonDeg() - from.getLonDeg());
+		double y = Math.sin(dLon) * Math.cos(lat2);
+		double x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+		return (Math.toDegrees(Math.atan2(y, x)) + 360.0) % 360.0;
+	}
+
+	/**
+	 * Goal and slope additions to the walk described above. If {@code goal} is not null, each option's cost is
+	 * reduced by {@code goalPull} x the metres of progress it makes toward the goal (negative progress costs), the
+	 * first heading defaults to the bearing to the goal, and a person within {@code goalRadiusM} of the goal stops
+	 * there for the rest of the simulation. {@code downhillBias} x metres of elevation gained is added to an
+	 * option's cost, so climbing is avoided. {@code maxSlope} (rise over run) is the steepest ground crossed.
+	 */
+	static Walk walk(Random rnd, LatLonGeo start, long startTime, int hours, double speedKph, Double headingDeg,
 			double headingSpreadDeg, double courseChangeDeg, int options, double stepM, double randomness, double maxDistanceM,
 			MovementSchedule schedule, AreaData area, UserEnteredGeospatialData geo, boolean stayOutOfWater,
-			List<LatLonGeo> trace) {
+			List<LatLonGeo> trace, LatLonGeo goal, CostField field, double goalPull, double goalRadiusM, double downhillBias,
+			double maxSlope, TrailGrid trails, double trailFactor, double trailSlope) {
 		AbstractElevationData elevation = area.getElevationData();
 		AbstractLandCoverData landcover = area.getLandcoverData();
 		BoundingBox box = area.getBoundingBox();
 
 		List<LatLonGeo> hourly = new ArrayList<>(hours + 1);
 		hourly.add(start);
+		if (trace != null) {
+			trace.add(start);
+		}
 		LatLonGeo pos = start;
-		double heading = headingDeg != null ? headingDeg + rnd.nextGaussian() * headingSpreadDeg : rnd.nextDouble() * 360.0;
+		boolean arrived = goal != null && start.getDistanceTo(goal) <= goalRadiusM;
+		double heading;
+		if (headingDeg != null) {
+			heading = headingDeg + rnd.nextGaussian() * headingSpreadDeg;
+		} else if (goal != null) {
+			heading = bearingDeg(start, goal) + rnd.nextGaussian() * headingSpreadDeg;
+		} else {
+			heading = rnd.nextDouble() * 360.0;
+		}
 		// people differ: some walk faster than others, for the whole simulation
 		double personFactor = Math.max(0.5, Math.min(2.0, Math.exp(0.25 * rnd.nextGaussian())));
 		double travelled = 0.0;
@@ -397,8 +818,10 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 				if (movingMs > 0) {
 					budget += speedKph * 1000.0 * ((double) movingMs / HOUR_MS) * personFactor;
 				}
-				while (budget > 0.0 && travelled < maxDistanceM) {
+				while (budget > 0.0 && travelled < maxDistanceM && !arrived) {
 					double elevHere = elevation.getElevationMetersForLatLon(pos);
+					double distToGoal = goal == null ? 0.0 : pos.getDistanceTo(goal);
+					double costHere = field == null ? Double.POSITIVE_INFINITY : field.costAt(pos);
 					int n = 0;
 					LatLonGeo[] candPos = new LatLonGeo[options];
 					double[] candHeading = new double[options], candCost = new double[options], candEffort = new double[options];
@@ -409,21 +832,46 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 						if (!allowed(cand, box, geo, landcover, stayOutOfWater)) {
 							continue;
 						}
-						double slope = (elevation.getElevationMetersForLatLon(cand) - elevHere) / stepM;
-						if (Math.abs(slope) > MAX_SLOPE) {
+						double rise = elevation.getElevationMetersForLatLon(cand) - elevHere;
+						double slope = rise / stepM;
+						boolean onTrail = trails != null && trails.at(cand.getLatDeg(), cand.getLonDeg()) > 0;
+						// passability is decided by how steep the ground is where the step lands, whatever the approach angle
+						double ground = Math.max(Math.abs(slope), gradient(elevation, cand));
+						if (ground > (onTrail ? trailSlope : maxSlope)) {
 							continue;
 						}
-						double tobler = Math.max(0.1, Math.min(1.25, Math.exp(-3.5 * (Math.abs(slope + 0.05) - 0.05))));
+						double grade = onTrail ? Math.max(-TRAIL_MAX_GRADE, Math.min(TRAIL_MAX_GRADE, slope)) : slope;
+						double tobler = tobler(grade);
 						double soa = landcover.getSoaFactor(cand.getLatDeg(), cand.getLonDeg());
 						if (Double.isNaN(soa) || soa <= 0.0) {
 							soa = 1.0;
 						}
 						int lcCost = landcover.getCost(cand.getLatDeg(), cand.getLonDeg());
 						double effort = stepM / (soa * tobler);          // metres of flat open ground this step is worth
+						if (onTrail) {
+							effort *= trailFactor;
+						}
 						candPos[n] = cand;
 						candHeading[n] = hd;
 						candEffort[n] = effort;
-						candCost[n] = effort * Math.max(1, lcCost);      // what the person tries to minimise
+						double cost = effort * Math.max(1, lcCost);      // what the person tries to minimise
+						if (goal != null && goalPull > 0.0) {
+							// progress is +1 for the step that best reduces the effort still needed to reach the goal
+							// (planned route), 0 for no change, -1 for a step that adds as much as it costs. Without a
+							// usable field (off its grid, unreachable), fall back to straight-line progress.
+							double progress;
+							double costThere = field == null ? Double.POSITIVE_INFINITY : field.costAt(cand);
+							if (Double.isFinite(costHere) && Double.isFinite(costThere)) {
+								progress = (costHere - costThere) / Math.max(effort, 1.0);
+							} else {
+								progress = (distToGoal - cand.getDistanceTo(goal)) / stepM;
+							}
+							cost *= 1.0 + goalPull * (1.0 - Math.max(-1.0, Math.min(1.0, progress)));
+						}
+						if (rise > 0.0) {
+							cost += downhillBias * rise;
+						}
+						candCost[n] = cost;
 						minCost = Math.min(minCost, candCost[n]);
 						n++;
 					}
@@ -467,11 +915,25 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 					if (trace != null) {
 						trace.add(pos);
 					}
+					if (goal != null && pos.getDistanceTo(goal) <= goalRadiusM) {
+						arrived = true;
+					}
 				}
 			}
 			hourly.add(pos);
 		}
-		return hourly;
+		return new Walk(hourly, arrived, trace);
+	}
+
+	/** Steepness of the ground at p, as rise over run, from elevation samples one DEM cell away in each direction. */
+	static double gradient(AbstractElevationData elevation, LatLonGeo p) {
+		double d = GRADIENT_SAMPLE_M;
+		double n = elevation.getElevationMetersForLatLon(p.displacedBy(d, Math.toRadians(90.0)));
+		double s = elevation.getElevationMetersForLatLon(p.displacedBy(d, Math.toRadians(270.0)));
+		double e = elevation.getElevationMetersForLatLon(p.displacedBy(d, 0.0));
+		double w = elevation.getElevationMetersForLatLon(p.displacedBy(d, Math.toRadians(180.0)));
+		double dzdy = (n - s) / (2.0 * d), dzdx = (e - w) / (2.0 * d);
+		return Math.sqrt(dzdx * dzdx + dzdy * dzdy);
 	}
 
 	private static boolean allowed(LatLonGeo p, BoundingBox box, UserEnteredGeospatialData geo,

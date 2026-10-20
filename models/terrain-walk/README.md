@@ -46,6 +46,65 @@ instead of spreading evenly in all directions.
 | `samples` | no | number of simulated people (10 to 20000) | 5000 |
 | `distance` | no | cap on total distance walked, in kilometres (like the form's "number of segments") | none |
 | `smoothing` | no | blur of the probability map in metres; 0 for none | 1.5 cells |
+| `goal pull` | no | detour tolerance toward a drawn goal: a sideways step costs (1 + pull) x a step toward it, a step away (1 + 2 pull) x; 0 = ignore the goal; 3+ is nearly a straight line | 1 if a goal is drawn, else 0 |
+| `goal radius` | no | metres from a goal at which a person has arrived and stops | 50 |
+| `downhill bias` | no | effort-metres added per metre of elevation gained; 2-5 sends people down drainages | 0 |
+| `max slope` | no | steepest ground (rise over run of the terrain itself, not of the step) a person will set foot on; steeper ground is a wall from every direction | 0.75 (about 37 degrees) |
+| `corridor` | no | 1 = every hourly map shows all ground covered during the walk (a route corridor) instead of positions by hour | 0 |
+| `trail factor` | no | effort multiplier on trail/road cells (needs `trails.txt`); lower = people prefer and stay on trails more | 0.5 |
+| `trail slope` | no | steepest rise-over-run crossed on a trail cell, so a trail up a cliff is passable while the cliff is not | 1.5 |
+
+## Goal points (known destination)
+
+The new-lost-person form offers a **goal points** step (green markers). With one or more goals drawn:
+
+- each simulated person picks one goal at random (several goals are alternatives, not a sequence);
+- before simulating, the model plans: a least-cost (Dijkstra) search from the goal over a 30 m grid of the bounding
+  box, priced exactly as the walkers price steps (slope, landcover, trails, passability), gives the effort still needed
+  from every cell. Each candidate step's cost is then multiplied by (1 + `goal pull` x (1 - progress)), where progress
+  is +1 for the step that reduces the remaining effort by as much as it costs (the planned route), 0 for no change
+  and -1 for a step that adds as much as it costs. A trail up a cliff therefore reads as progress even while it points
+  away from the goal, and a river bench that dead-ends below the goal does not. Raise `goal pull` for a tighter bundle,
+  lower it (or raise `randomness`) for a wider one;
+- if `heading` is blank the first heading is the bearing to the goal, spread by `heading spread`;
+- a person within `goal radius` of the goal stops and stays there;
+- people who never arrive within `duration` are discarded from the maps and drawn paths, since the subject is known to
+  have reached the goal. If nobody arrives, all are kept and a status message says so: give more hours, more pull, a
+  larger radius or a gentler `max slope`.
+
+Typical use: last-seen point = where the subject was last on a known route, goal = where a clue was found. `corridor` = 1 shows
+the whole route on every hourly map (so the maps do not change over time); leave it 0 to watch the hourly maps move.
+The drawn sample paths and the corridor map together show the likely routes between the two.
+
+## Trails and roads (OpenStreetMap)
+
+LandSAR Base's disk geocache loader knows nothing about trails, so the model reads its own layer: a
+`trails.txt` grid in each geocache tile (same grid as `elevation.txt`; 0 = none, 1 = trail, 2 = road), written
+by `tools/build_trails.py` from an `.osm.pbf` extract:
+
+```bash
+python3 tools/build_trails.py ~/Downloads/COCO.osm.pbf geocache-az-state 36.80 36.95 -111.70 -111.50
+```
+
+The model finds the tiles through the `"trail cache directory"` property on its `config.json` entry (set to
+`geocache-az-state`). Tiles without `trails.txt` simply have no trails. On a trail or road cell a step costs
+`trail factor` x the normal effort, the grade used for walking speed is capped at 0.3 (switchbacks are gentler
+than the cells they cross), and the slope limit is `trail slope` instead of `max slope`. Nothing else changes, so
+people on a trail tend to stay on it because leaving it costs more, and a trail is the only way up ground steeper
+than `max slope`.
+
+Passability is judged by the steepness of the ground where a step lands (gradient from DEM samples one cell apart),
+so a cliff band cannot be climbed by stepping across it obliquely. The grade along the step still sets walking speed.
+
+## Downhill bias (unknown destination, descending)
+
+`downhill bias` charges extra effort for every metre climbed. With it at 0 the only slope effect is Tobler's speed
+function, which makes climbing slower but not avoided. At 2-5, people move downslope and collect in drainages. Slopes
+steeper than `max slope` remain impassable, so from a cliff-edge start people stay on the rim until they find a
+break they can walk down; nobody goes over the edge.
+
+Corridor maps are only the initial distribution. Updating for a search (search evaluation) always recomputes the
+affected hours from positions by hour.
 
 Optional parameters deliberately have no unit: a blank optional field that carries a unit is sent by the web form
 as the whole number 0, which LandSAR's parameter conversion cannot cast to a Double, and the request is silently
@@ -66,8 +125,8 @@ Apply the patches with `python3 tools/apply_patches.py` first (finer probability
 
 ## Limits
 
-- No roads or trails (Base has no trail data), no subject categories (child, dementia, hunter ...), no goals or
-  destinations, and no fatigue or injury (the published model has an exhaustion and recovery level; this one does not).
+- No roads or trails (Base has no trail data), no subject categories (child, dementia, hunter ...), goals are
+  alternatives rather than an ordered sequence, and no fatigue or injury (the published model has an exhaustion and recovery level; this one does not).
 - It is an interpretation of a published description, not BBN's code, and its parameters are not calibrated.
 - Landcover speed factors and costs in Base are placeholders (1.0, water 2.0). Edit
   `defaultParams/landcover-defaults.txt` for realistic values; the model uses both.

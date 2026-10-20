@@ -245,7 +245,8 @@
             },
 	     {
 		"name": "TerrainWalk",
-		"className": "landsar.terrainwalk.TerrainWalkMotionModelPlugin"
+		"className": "landsar.terrainwalk.TerrainWalkMotionModelPlugin",
+		"trail cache directory": "geocache-az-state"
 	     }
 
          ]
