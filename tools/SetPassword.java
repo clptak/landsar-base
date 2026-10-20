@@ -3,7 +3,7 @@ import java.util.Scanner;
 import org.apache.shiro.authc.credential.DefaultPasswordService;
 
 /** Sets a LandSAR user's password. Run inside the container; reads the new password from stdin.
- *  docker compose exec -T landsar java -cp "/opt/landsar/tools-bin:/opt/landsar/dependencies/*" SetPassword admin */
+ *  docker compose exec -T landsar java -cp "/opt/landsar/tools-bin:/opt/landsar/roger-core-dependencies/dependencies/*" SetPassword admin */
 public class SetPassword {
     public static void main(String[] args) throws Exception {
         if (args.length != 1) { System.err.println("usage: SetPassword <username>  (new password on stdin)"); System.exit(2); }
