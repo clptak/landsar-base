@@ -208,7 +208,7 @@ Plan for the web UI's results to be per-search rather than per-user: LandSAR has
 
 ## 11. Order of work
 
-1. Build the image and run it on the VPS with the demo login, on the internal network only; open the UI through an SSH tunnel.
+1. Build the image and run it on the VPS with the demo login, on the internal network only; open the UI through an SSH tunnel. **Done 2026-10-20: login and a Flagstaff search work (section 13).**
 2. Add the proxy and TLS; confirm a search works through it (websockets).
 3. Switch `shiro.ini` to LDAP (option A); confirm a TAK user can log in and a non-member cannot.
 4. Remove the demo admin; rotate the keystore and cipher key; check the port list from outside.
@@ -221,3 +221,32 @@ Plan for the web UI's results to be per-search rather than per-user: LandSAR has
 - Whether Authentik's LDAP outpost serves two providers, and the real base DN in your deployment.
 - Framing the UI inside CloudTAK; the session cookie's behaviour through the proxy.
 - Memory and start-up time with the statewide cache under load.
+
+## 13. First deployment: what happened [verified on the VPS, 2026-10-20]
+
+The image built from `Dockerfile.vps`, the patches applied, the demo login worked through an SSH tunnel and a Flagstaff
+search ran against the statewide cache. Problems met, in the order they appeared:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Container restarts; log says `/opt/roger/logs/dockerlog.log: No such file` | The repo's `Dockerfile` is only a bare Java 8 base that expects the project mounted at `/opt/roger`. | Build with `dockerfile: Dockerfile.vps`. |
+| Build fails: `No such file ... /opt/homebrew/opt/openjdk@11/bin/javac` | The patch scripts default to the Mac's `javac`. | `ENV JAVAC=javac` in the build stage (now in `Dockerfile.vps`). |
+| `error mounting ... shiro.ini ... not a directory` | The mounted file did not exist, so Docker created a root-owned directory of that name, and recreates it at every `up` while the mount line stays. | Delete or comment the mount line, then `rmdir shiro.ini` (use `sudo` if needed). Mount a real file only once it exists. |
+| Tunnel: `connect failed: Connection refused` | Container not running (see rows above); nothing listened on `127.0.0.1:8800`. | `docker compose ps` and `logs` first. |
+| Browser closes the connection straight away | Self-signed certificate (`use_tls` is on). | Use `https://`, accept the warning. |
+| Search: "bounding box is outside the elevation model" | The bind-mounted `geocache-az-state` was empty when the server started. The cache is read **once at startup** (log line `Directory contains 0 files`, bounding box `Infinity`). | Copy the cache in (`rsync`), then `docker compose restart landsar`. |
+
+Commands that worked:
+
+- Tunnel: `ssh -N -L 9800:localhost:8800 user@host`, then `https://localhost:9800/`. Needs `ports: ["127.0.0.1:8800:8800"]` on the service.
+- Cache copy: `rsync -avP --partial geocache-az-state/ user@host:tak-stack/geocache-az-state/` (3.2 GB, resumable; `chown` the target first if Docker created it).
+- Check the cache loaded: `docker compose logs landsar | grep -E "Directory contains|Offline data cache has bounding box"`; expect about 508 entries and a box covering the state plus margin.
+- Real errors: `docker compose logs landsar | grep -v DEBUG | tail -60` (the log is full of Jetty `DEBUG` lines until `logback.xml` is lowered).
+
+Corrections to the sketches above:
+
+- Section 8's `networks: { tak-network: { external: true } }` fails when the stack already names its default network
+  `tak-network`; then the service needs no `networks:` entry at all.
+- Run `docker compose` in the stack folder, and `git` in the `landsar-base` clone (a different repository).
+- The `shiro.ini` mount in section 8 is optional until `shiro.ini` is edited for LDAP; the image carries the repo copy.
+- The VPS runs whatever is **committed** on the branch: local, uncommitted TerrainWalk changes are not in the image.
