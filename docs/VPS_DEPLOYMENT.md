@@ -197,7 +197,11 @@ Plan for the web UI's results to be per-search rather than per-user: LandSAR has
 
 ## 10. Hardening checklist
 
-- Change `admin`'s password with the bundled tool [untested]: `docker compose exec -T landsar java -cp "/opt/landsar/tools-bin:/opt/landsar/roger-core-dependencies/dependencies/*" SetPassword admin` (new password on stdin, 12+ characters; it verifies the update). Use `read -s` and a pipe so it stays out of shell history.
+- Change `admin`'s password with the bundled tool [verified on the Mac, untested on the VPS]. The classpath must be the server's (`roger-core-dependencies/`, consistent logging jars) plus only the Shiro/Derby jars from `dependencies/` (which holds conflicting logback versions):
+  ```bash
+  CP="/opt/landsar/tools-bin:/opt/landsar/roger-core-dependencies/dependencies/*"; for j in shiro-core shiro-crypto-core shiro-crypto-hash shiro-crypto-cipher shiro-lang shiro-config-core shiro-cache shiro-event commons-beanutils commons-collections derbyclient; do CP="$CP:$(docker compose exec -T landsar sh -c "ls /opt/landsar/dependencies/$j-*.jar | head -1")"; done
+  read -rs PW && printf '%s\n' "$PW" | docker compose exec -T landsar java -cp "$CP" SetPassword admin; unset PW
+  ```
 - Remove or change `admin`/`demotime`. With option A the Derby user table is no longer consulted for login.
 - Replace the committed keystore and its password (`landsar-base.jks`), or terminate TLS only at the proxy.
 - Replace the fixed "remember me" cipher key in `shiro.ini`.
