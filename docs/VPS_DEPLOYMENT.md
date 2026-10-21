@@ -364,3 +364,46 @@ Notes:
 - The Derby `admin` login and `shiro.ini` (cipher key, section 15) no longer matter for the 8800 UI, but leave them: they
   are the way back if forward auth is removed.
 - Undo: restore the earlier Caddy block, revert the `Dockerfile.vps` change, rebuild.
+
+## 18. Federating the second deployment's Authentik [verified on the VPS, 2026-10-21]
+
+A = the Authentik on this VPS (hosts LandSAR); B = the other deployment's Authentik (other server). B's people log in to
+LandSAR through A, using B as an OpenID Connect login source. LandSAR knows nothing about this; it only sees Caddy.
+
+**On A: keep federated users out of everything except LandSAR.** (Done before the source existed.)
+- Group `federated-deployment-2` (members are created automatically at first login, below).
+- On **every other application** on A (TAK Portal, TAK LDAP v2, nodered-proxy, ...): a binding on that group with
+  **Negate result on**. It lets in everyone except federated users and changes nothing for current users. Verify with a
+  normal user afterwards. (An application with no binding at all is open to every user Authentik knows.)
+- On the **LandSAR** application: bindings for `landsar-users` and `federated-deployment-2`, **no negate**, policy mode
+  ANY. A negated binding here by mistake let every non-federated user in; check with a user outside `landsar-users`.
+
+**On B:** OAuth2/OpenID provider (confidential), redirect URI
+`https://<A>/source/oauth/callback/deployment-2/` (strict), an application `landsar-login` with a binding for the group
+that may use LandSAR. Scopes: `openid`, `email` and a custom scope mapping **`profile-no-groups`** (scope name `profile`,
+returns `name`, `given_name`, `preferred_username`, `nickname`, **no `groups`**) in place of the default `profile`.
+
+**On A:** OpenID Connect OAuth source `deployment-2` (client ID/secret from B, B's `.well-known/openid-configuration`
+URL), user matching mode *Link users on unique identifier*, enrollment flow `deployment-2-enrollment` =
+`default-source-enrollment-prompt` (0), new user-write stage `deployment-2-write` (1, *Always create new users*, **Group =
+`federated-deployment-2`**), `default-source-enrollment-login` (2). The source is added to the login page through the
+identification stage's *Sources* list.
+
+**Why the custom `profile` scope:** A copies the `groups` list B sends. B had a group `tak_CCSO Sworn`, A already had one
+with that name, so creating it failed (`IntegrityError ... authentik_core_group_name ... already exists`) and every
+login ended on "Something went wrong" (the user was still created and signed in). No Group Property Mapping on A
+controls this, and the Group matching mode choices do not avoid the collision (one of them, *Link to a group with
+identical name*, would put B's people into A's own groups: never use it). Not sending groups from B removes the error.
+
+**Cookie the LandSAR page needs.** The web UI reads a browser cookie `username` (set by LandSAR's own login page, now
+off) to name searches; without it the first form fails with `null ... username.toLowerCase`. Caddy sets it from
+Authentik's header: in the LandSAR block add, after `forward_auth` and before `reverse_proxy`:
+`header +Set-Cookie "username={http.request.header.X-Authentik-Username}; Path=/; Secure; SameSite=Lax"` (the `+` keeps
+LandSAR's own cookies). The cookie is cosmetic; access is decided by Authentik.
+
+**What a B user does:** open `https://landsar.<domain>/`, click the small OpenID icon on A's login page, log in on B, and
+land on the map. (Without a bookmark to the LandSAR address they end on Authentik's library page.) Federated users have
+no password on A, so A's own login box rejects them.
+
+Tests passed: member and non-member of `landsar-users`; B user reaches LandSAR and is refused TAK Portal; search runs
+for the federated user.
