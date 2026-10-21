@@ -417,6 +417,10 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 		}
 		motionModelManager.sendInProgressUpdate(this.name + ": simulating " + samples + " people for " + hours + " hours.", status);
 
+		CAND.reset();
+		CAND_TRAIL.reset();
+		STEPS.reset();
+		STEPS_TRAIL.reset();
 		List<Walk> walks = IntStream.range(0, samples).parallel().mapToObj(i -> {
 			Random rnd = new Random(baseSeed + i * 0x9E3779B97F4A7C15L);
 			LatLonGeo start = starts.get(i % starts.size());
@@ -429,6 +433,11 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 					goal, field, goalPull, goalRadiusM, downhillBias, maxSlope, trailGrid, trailFactor, trailSlope);
 		}).collect(Collectors.toList());
 
+		if (trailGrid != null && STEPS.sum() > 0 && CAND.sum() > 0) {
+			LOGGER.info("TerrainWalk: trail/road share: {}% of candidate steps, {}% of chosen steps (trail factor {})",
+					String.format("%.1f", 100.0 * CAND_TRAIL.sum() / CAND.sum()),
+					String.format("%.1f", 100.0 * STEPS_TRAIL.sum() / STEPS.sum()), trailFactor);
+		}
 		if (goals != null) {
 			long arrived = walks.stream().filter(w -> w.arrived).count();
 			if (arrived == 0) {
@@ -737,6 +746,11 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 		}
 	}
 
+	/** Log-only diagnostic: how often candidate and chosen steps land on a trail/road cell. shortcut: static, so concurrent searches mix their counts. */
+	static final java.util.concurrent.atomic.LongAdder CAND = new java.util.concurrent.atomic.LongAdder(),
+			CAND_TRAIL = new java.util.concurrent.atomic.LongAdder(), STEPS = new java.util.concurrent.atomic.LongAdder(),
+			STEPS_TRAIL = new java.util.concurrent.atomic.LongAdder();
+
 	/** One simulated person: hourly positions, whether they reached their goal, and (optionally) every step. */
 	static final class Walk {
 		final List<LatLonGeo> hourly;
@@ -825,6 +839,7 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 					int n = 0;
 					LatLonGeo[] candPos = new LatLonGeo[options];
 					double[] candHeading = new double[options], candCost = new double[options], candEffort = new double[options];
+					boolean[] candOn = new boolean[options];
 					double minCost = Double.MAX_VALUE;
 					for (int k = 0; k < options; k++) {
 						double hd = heading + rnd.nextGaussian() * courseChangeDeg;
@@ -854,6 +869,11 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 						candPos[n] = cand;
 						candHeading[n] = hd;
 						candEffort[n] = effort;
+						candOn[n] = onTrail;
+						CAND.increment();
+						if (onTrail) {
+							CAND_TRAIL.increment();
+						}
 						double cost = effort * Math.max(1, lcCost);      // what the person tries to minimise
 						if (goal != null && goalPull > 0.0) {
 							// progress is +1 for the step that best reduces the effort still needed to reach the goal
@@ -901,6 +921,10 @@ public class TerrainWalkMotionModelPlugin implements LandMotionModelPlugin {
 						bestPos = candPos[pick];
 						bestHeading = candHeading[pick];
 						bestEffort = candEffort[pick];
+						STEPS.increment();
+						if (candOn[pick]) {
+							STEPS_TRAIL.increment();
+						}
 					}
 					if (bestPos == null) {
 						// boxed in: turn around somewhere else and lose a little time
