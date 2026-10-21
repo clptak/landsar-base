@@ -284,3 +284,19 @@ landsar.{$PRIMARY_DOMAIN} {
 - Websocket searches work through the proxy. The page's websocket closes after 300 s idle (`Idle timeout expired: 300001/300000 ms`): if a result does not appear, reload the page (F5) and reselect the lost person.
 - The log message `Error parsing attribute ... Value:` for blank optional fields is expected; the Mac log has the same lines.
 - The goal-points step and `corridor` only appear after the image is rebuilt from a commit that contains them (the first image was built from the earlier TerrainWalk).
+
+## 15. Rotating the "remember me" cipher key [verified on the VPS, 2026-10-20]
+
+The repo's `shiro.ini` carries a fixed key, so the stack keeps its own copy with a new one:
+
+```bash
+cd ~/tak-stack
+KEY="0x$(openssl rand -hex 16)"; cp landsar-base/shiro.ini shiro.ini && sed -i "s|^securityManager.rememberMeManager.cipherKey = .*|securityManager.rememberMeManager.cipherKey = $KEY|" shiro.ini && chmod 600 shiro.ini; unset KEY
+```
+
+Then enable the `- ./shiro.ini:/opt/landsar/shiro.ini:ro` mount, `docker compose up -d landsar`, and confirm
+`docker compose exec landsar grep -c 0xae399881 /opt/landsar/shiro.ini` prints `0`. Everyone has to log in again. Add
+`shiro.ini` to the stack repo's `.gitignore` (it holds a secret). The file must exist before the mount line is enabled, or
+Docker creates a directory in its place (section 13).
+
+Do not paste the key anywhere. When option A (LDAP) replaces the realm in this file, edit the stack's copy, not the repo's.
