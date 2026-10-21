@@ -4,6 +4,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 unzip w
 WORKDIR /opt/landsar
 COPY . .
 ENV JAVAC=javac
+# Authentik (Caddy forward_auth) is the login on the VPS; only Caddy can reach this container (see docs/VPS_DEPLOYMENT.md)
+RUN sed -i 's/"use_auth":true/"use_auth":false/' config.json && ! grep -q '"use_auth":true' config.json
 RUN wget -q https://github.com/NASAWorldWind/WorldWindJava/releases/download/v2.1.0/worldwind-v2.1.0.zip \
  && unzip -q -j worldwind-v2.1.0.zip worldwind.jar -d dependencies/ && rm worldwind-v2.1.0.zip
 RUN ./gradlew --no-daemon copyRuntimeLibs
