@@ -313,3 +313,54 @@ Caddy's Let's Encrypt certificate. Decision: leave it, because replacing it woul
 - Residual risk: any other container on `tak-network` can connect to LandSAR and, knowing the keystore key, impersonate
   it to a client that verifies the certificate. Revisit if an untrusted container joins that network; the options are a
   new keystore with a mounted `config.json`, or plain HTTP on the backend with a Caddy `Location` rewrite.
+
+## 17. Authentik in front (single sign-on) [verified on the VPS, 2026-10-21]
+
+Chosen over the LDAP realm: two CloudTAK deployments on two servers, each with its own Authentik and LDAP outpost, need
+access, and an LDAP realm cannot reach both safely. Design: LandSAR sits behind **this** VPS's Authentik; the other
+deployment's Authentik is added as a federated login source (not done yet, section 18).
+
+1. **Isolate LandSAR** so nothing but Caddy can reach it (necessary once its own login is off). In `docker-compose.yml`:
+   `landsar` gets `networks: [landsar-net]`; `caddy` gets `landsar-net: {}` under its existing `networks:` (keeping `default`
+   and its alias); the bottom `networks:` block defines `landsar-net: {name: landsar-net}`. Check:
+   `docker network inspect landsar-net --format '{{range .Containers}}{{.Name}} {{end}}'` lists only `caddy` and the LandSAR container.
+2. **Authentik** (2026.5.7): group `landsar-users`; Proxy Provider "LandSAR proxy", mode *Forward auth (single
+   application)*, external host `https://landsar.<domain>`; application `landsar` with the group bound under *Policy /
+   Group / User Bindings* (an application with no binding is open to every user); added to the **embedded outpost**.
+3. **Caddy** block (same pattern as the TAK Portal block):
+
+```
+landsar.{$PRIMARY_DOMAIN} {
+	import rsa_cert
+	route {
+		reverse_proxy /outpost.goauthentik.io/* authentik-server-1:9000
+		forward_auth authentik-server-1:9000 {
+			uri /outpost.goauthentik.io/auth/caddy
+			copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name
+			trusted_proxies private_ranges
+		}
+		reverse_proxy https://landsar:8800 {
+			header_up Host {host}
+			header_down Location "^(https://[^/]+):8800/" "$1/"
+			transport http {
+				tls_insecure_skip_verify
+			}
+		}
+	}
+}
+```
+
+4. **Turn off LandSAR's own login.** `Dockerfile.vps` rewrites `"use_auth":true` to `false` on the 8800 plugin at build
+   time (the build fails if any `true` is left); the Mac's `config.json` is untouched. Check:
+   `docker compose exec landsar grep -c '"use_auth":false' /opt/landsar/config.json` prints `2`.
+
+Results: an unauthenticated request gets a 302 to Authentik; a member of `landsar-users` reaches the map with a single
+login; a user outside the group is refused by Authentik; a search runs through the gate (websocket included).
+
+Notes:
+- LandSAR's own logout button no longer logs anyone out of Authentik; use Authentik's logout. Its behaviour was not tested.
+- With `use_auth` off, **anything that can reach `landsar:8800` is let in.** Keep it on `landsar-net` only, and do not
+  publish 8800, 8082, 9095 or 1621.
+- The Derby `admin` login and `shiro.ini` (cipher key, section 15) no longer matter for the 8800 UI, but leave them: they
+  are the way back if forward auth is removed.
+- Undo: restore the earlier Caddy block, revert the `Dockerfile.vps` change, rebuild.
