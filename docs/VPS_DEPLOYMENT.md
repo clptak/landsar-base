@@ -300,3 +300,16 @@ Then enable the `- ./shiro.ini:/opt/landsar/shiro.ini:ro` mount, `docker compose
 Docker creates a directory in its place (section 13).
 
 Do not paste the key anywhere. When option A (LDAP) replaces the realm in this file, edit the stack's copy, not the repo's.
+
+## 16. Committed keystore: decision (2026-10-20)
+
+`landsar-base.jks` and its password (`landsarMotionModels`, in `config.json`) are public in the repository. The key only
+protects the Caddy-to-LandSAR hop inside `tak-network`, where Caddy skips certificate verification anyway; browsers see
+Caddy's Let's Encrypt certificate. Decision: leave it, because replacing it would need a mounted copy of `config.json`
+(drift from the repo), and instead make sure only Caddy can reach port 8800:
+
+- Remove the `ports: ["127.0.0.1:8800:8800"]` mapping from the `landsar` service (the SSH tunnel is no longer needed).
+- Keep 8082, 9095 and 1621 unpublished (never add them to `ports:`).
+- Residual risk: any other container on `tak-network` can connect to LandSAR and, knowing the keystore key, impersonate
+  it to a client that verifies the certificate. Revisit if an untrusted container joins that network; the options are a
+  new keystore with a mounted `config.json`, or plain HTTP on the backend with a Caddy `Location` rewrite.
